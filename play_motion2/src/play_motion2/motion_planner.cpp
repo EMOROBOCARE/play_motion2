@@ -620,58 +620,87 @@ ControllerStates MotionPlanner::filter_controller_states(
 
 FollowJTGoalHandleFutureResult MotionPlanner::send_trajectory(
   const std::string & controller_name,
-  const JointTrajectory & trajectory)
+  const JointTrajectory & trajectory)  // ignoring input trajectory
 {
-  rclcpp_action::Client<FollowJointTrajectory>::SharedPtr action_client;
-  if (action_clients_.count(controller_name) != 0) {
-    action_client = action_clients_[controller_name];
-  } else {
-    action_client = rclcpp_action::create_client<FollowJointTrajectory>(
-      node_,
-      "/" + controller_name + "/follow_joint_trajectory",
-      motion_planner_cb_group_);
-    action_clients_[controller_name] = action_client;
+  using namespace std::chrono_literals;
+
+  RCLCPP_INFO(node_->get_logger(), "Controller name: '%s'", controller_name.c_str());
+  std::string action_name = "/" + controller_name + "/follow_joint_trajectory";
+  RCLCPP_INFO(node_->get_logger(), "Using action: '%s'", action_name.c_str());
+  
+  auto action_client = rclcpp_action::create_client<FollowJointTrajectory>(
+    node_,
+    "/" + controller_name + "/follow_joint_trajectory",
+    motion_planner_cb_group_);
+
+  action_clients_[controller_name] = action_client;
+
+  if (!action_client->wait_for_action_server(2s)) {
+    RCLCPP_ERROR(node_->get_logger(), "Action server '/%s/follow_joint_trajectory' not available",
+                 controller_name.c_str());
+    return FollowJTGoalHandleFutureResult{};
   }
 
-  if (!action_client->wait_for_action_server(1s)) {
-    RCLCPP_ERROR_STREAM(
-      node_->get_logger(),
-      "/" << controller_name <<
-        "/follow_joint_trajectory action server not available after waiting");
-    return {};
-  }
-
-  /// @todo fill rest of the fields ??
+  // Build the hardcoded trajectory goal
   auto goal = FollowJointTrajectory::Goal();
-  goal.trajectory = trajectory;
 
-  auto goal_handle = action_client->async_send_goal(goal);
+  //put the GOOD ones
+  goal.trajectory.joint_names = trajectory.joint_names;
+  goal.trajectory.points = trajectory.points;
 
-  if (!goal_handle.valid()) {
-    return {};
+  // Debug print: full goal data
+  RCLCPP_INFO(node_->get_logger(), "Loaded trajectory has %zu points", trajectory.points.size());
+  RCLCPP_INFO(node_->get_logger(), "Joint names:");
+  for (auto &jn : trajectory.joint_names) {
+    RCLCPP_INFO(node_->get_logger(), "  %s", jn.c_str());
   }
-  std::future_status status;
-  auto start_t = node_->now();
-  do {
-    status = goal_handle.wait_for(0.1s);
-    if (node_->now() - start_t > kTimeout) {
-      RCLCPP_ERROR_STREAM(
-        node_->get_logger(),
-        "Timeout while waiting for " << "/" << controller_name <<
-          "/follow_joint_trajectory result");
-      return {};
+  
+  for (size_t pt_i = 0; pt_i < trajectory.points.size(); ++pt_i) {
+    const auto &pt = trajectory.points[pt_i];
+    std::stringstream ss;
+    ss << "Point " << pt_i << " positions: [";
+    for (auto p : pt.positions) ss << p << ", ";
+    ss << "], time_from_start = " << pt.time_from_start.sec << "s";
+    RCLCPP_INFO(node_->get_logger(), ss.str().c_str());
+  }
+  
+
+  // Send the goal (async, no waiting for result)
+  auto goal_handle_future = action_client->async_send_goal(goal);
+
+  // Wait for goal handle asynchronously (non-blocking)
+  if (goal_handle_future.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+    RCLCPP_ERROR(node_->get_logger(), "Timeout waiting for goal handle");
+    return FollowJTGoalHandleFutureResult{};
+  }
+
+  auto goal_handle = goal_handle_future.get();
+  if (!goal_handle) {
+    RCLCPP_ERROR(node_->get_logger(), "Goal rejected by server");
+    return FollowJTGoalHandleFutureResult{};
+  }
+
+  // Get future for result
+  auto result_future = action_client->async_get_result(goal_handle);
+
+  // Non-blocking wait for result with periodic spin_some
+  auto start_time = std::chrono::steady_clock::now();
+  while (result_future.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+    // just sleep here or yield to allow other threads to run
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    auto elapsed = std::chrono::steady_clock::now() - start_time;
+    if (elapsed > std::chrono::seconds(10)) {
+      RCLCPP_ERROR(node_->get_logger(), "Timeout waiting for result");
+      return FollowJTGoalHandleFutureResult{};
     }
-  } while(status != std::future_status::ready);
-
-  FollowJTGoalHandleFutureResult result;
-  try {
-    result = action_client->async_get_result(goal_handle.get());
-  } catch (const rclcpp_action::exceptions::UnknownGoalHandleError &) {
-    result = {};
   }
+  
 
-  return result;
+  // Result ready, return the future (or handle the result here)
+  return result_future;
 }
+
+
 
 Result MotionPlanner::send_trajectories(
   const std::string & motion_key,
@@ -685,7 +714,7 @@ Result MotionPlanner::send_trajectories(
         node_->get_logger(),
         "Cannot perform motion '" << motion_key << "'");
       // cancel all sent goals
-      cancel_all_goals();
+      //cancel_all_goals();
 
       return Result(
         Result::State::ERROR,
@@ -712,7 +741,7 @@ Result MotionPlanner::wait_for_results(
   // Spin all futures and remove them when succeeded.
   // If one fails, set failed to true and returns false
   const auto successful_jt = [&](FollowJTGoalHandleFutureResult & future) {
-      std::future_status status = future.wait_for(0.1s);
+    std::future_status status = future.wait_for(1s);
       if (status == std::future_status::ready) {
         if (future.get().code == rclcpp_action::ResultCode::SUCCEEDED) {
           return true;
@@ -739,6 +768,9 @@ Result MotionPlanner::wait_for_results(
     auto current_states = filter_controller_states(
       get_controller_states(), "active", "joint_trajectory_controller/JointTrajectoryController");
 
+      RCLCPP_INFO(node_->get_logger(), "Futures left: %zu, On time: %s", futures_list.size(), on_time ? "true" : "false");
+      RCLCPP_INFO(node_->get_logger(), "Current controllers count: %zu", current_states.size());
+    
     // If any controller changes, check if it is used in the motion.
     // If so, cancel all goals and return an error.
     if (current_states != motion_controller_states_) {

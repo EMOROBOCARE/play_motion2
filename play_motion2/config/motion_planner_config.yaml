@@ -3,4 +3,9 @@ play_motion2:
     motion_planner:
       approach_velocity: 0.5
       approach_min_duration: 0.5
-
+      disable_motion_planning: true
+      planning_groups: 
+        - joint_trajectory_controller
+      joint_tolerance: 0.01
+      approach_velocity: 0.5
+      approach_min_duration: 0.5
